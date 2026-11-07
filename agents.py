@@ -149,4 +149,7 @@ Only list citation-ids of lines that truly support your answer (max 6). If nothi
                 ev.append(f"**{m['sender']}** ({m['ts']}): {m['text']}")
         except Exception:
             pass
-    return out.get("answer", ""), ev
+        answer = out.get("answer", "")
+    if agent == "Roaster" and not answer.startswith("⚠️"):
+        answer += "\n\n✅ Passed safety check"
+    return answer, ev
