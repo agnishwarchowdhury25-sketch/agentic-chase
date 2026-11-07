@@ -153,3 +153,128 @@ Only list citation-ids of lines that truly support your answer (max 6). If nothi
     if agent == "Roaster" and not answer.startswith("⚠️"):
         answer += "\n\n✅ Passed safety check"
     return answer, ev
+_PERSONAS = {}
+
+
+def _persona_cached(chat_ids, person):
+    owner = next((c for c in chat_ids if (db.messages(c).sender == person).any()), chat_ids[0])
+    k = (owner, person)
+    if k not in _PERSONAS:
+        _PERSONAS[k] = persona(owner, person)
+    return _PERSONAS[k]
+
+
+def _build(agent, chat_ids, question, person, tone, optout, history):
+    recent = list(history)[-6:]
+    search_q = " ".join([h[0] for h in recent[-2:]] + [question]) + (f" {person}" if person else "")
+    ctx, st = [], {}
+    for cid in chat_ids:
+        df = db.messages(cid)
+        st[cid] = stats(df)
+        ctx += rag.retrieve(cid, search_q, spread=(agent == "Deep Analyzer"))
+
+    persona_txt = ""
+    if person and agent in ("Roaster", "Reply Giver"):
+        persona_txt = f"\nPERSONA of {person}: {json.dumps(_persona_cached(chat_ids, person))}"
+
+    extra = ""
+    if agent == "Roaster":
+        extra = (
+            f"\nTONE: {TONES[tone]}\nBANNED TOPICS: {BANNED}"
+            f"\nDo NOT roast: {', '.join(optout) or 'nobody opted out'}."
+            f"\nTarget: {person or 'whoever fits the question'}."
+        )
+
+    convo = "\n".join(f"User: {q}\nAssistant: {a}" for q, a in recent) or "(this is the first message)"
+
+    prompt = f"""STATS: {json.dumps(st, default=str)}{persona_txt}
+
+CONVERSATION SO FAR:
+{convo}
+
+CHAT EXCERPTS (each line starts with a [citation-id]):
+{chr(10).join(ctx)}
+{extra}
+
+USER MESSAGE: {question}
+
+How to answer:
+- Write like a friendly, sharp assistant (like ChatGPT or Claude). Answer directly first, then add detail.
+- Short paragraphs. Use bullets only when they help. Use **bold** for names and key numbers.
+- Keep it under about 200 words unless the user asks for more.
+- If the user asks a follow-up ("why?", "and him?", "more"), use the CONVERSATION SO FAR.
+- Never invent messages. If the excerpts do not contain the answer, say so.
+- Finish with one last line in exactly this form: EVIDENCE: [id], [id]
+  (up to 6 citation ids copied from the excerpts that support your answer), or EVIDENCE: none"""
+    return SYSTEM[agent], prompt
+
+
+def _pieces(agent, system, prompt):
+    if agent == "Roaster":
+        text = ""
+        safe = False
+        for _ in range(2):
+            text = llm(system, prompt)
+            body = text.split("EVIDENCE:")[0]
+            if is_safe(body):
+                safe = True
+                break
+            prompt += "\nYour previous attempt was unsafe. Make it gentler and avoid banned topics."
+        if safe:
+            body, _, tail = text.partition("EVIDENCE:")
+            text = body.strip() + "\n\n✅ Passed safety check\nEVIDENCE:" + tail
+        else:
+            text = "⚠️ Couldn't generate a safe roast for this request. Try a different person or a milder tone.\nEVIDENCE: none"
+        words = text.split(" ")
+        for i in range(0, len(words), 3):
+            yield " ".join(words[i:i + 3]) + " "
+            time.sleep(0.03)
+        return
+
+    cfg = types.GenerateContentConfig(system_instruction=system)
+    last = None
+    for attempt in range(4):
+        got = False
+        try:
+            for ch in client.models.generate_content_stream(model=MODEL, contents=prompt, config=cfg):
+                if ch.text:
+                    got = True
+                    yield ch.text
+            return
+        except Exception as e:
+            last = e
+            if got:
+                return
+            time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"AI is busy or unreachable: {str(last)[:150]}")
+
+
+def chat_stream(agent, chat_ids, question, person=None, tone="Mild", optout=(), history=(), result=None):
+    system, prompt = _build(agent, chat_ids, question, person, tone, optout, history)
+    full = ""
+    sent = 0
+    for piece in _pieces(agent, system, prompt):
+        full += piece
+        if "EVIDENCE:" in full:
+            limit = full.index("EVIDENCE:")
+        else:
+            limit = max(0, len(full) - 12)
+        if limit > sent:
+            yield full[sent:limit]
+            sent = limit
+    body, _, tail = full.partition("EVIDENCE:")
+    if len(body) > sent:
+        yield body[sent:]
+
+    ev, seen = [], set()
+    for m in re.findall(r"[0-9a-f]{6}-\d+", tail):
+        if m in seen or len(ev) >= 6:
+            continue
+        seen.add(m)
+        cid, mid = m.rsplit("-", 1)
+        row = db.get_message(cid, mid)
+        if row:
+            ev.append(f"**{row['sender']}** ({row['ts']}): {row['text']}")
+    if result is not None:
+        result["answer"] = body.strip()
+        result["evidence"] = ev
