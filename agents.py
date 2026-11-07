@@ -32,11 +32,26 @@ def llm(system, user, as_json=False):
 
 def llm_json(system, user):
     t = llm(system + "\nReturn ONLY valid JSON.", user, as_json=True)
-    m = re.search(r"\{.*\}", t, re.S)
     try:
-        return json.loads(m.group(0))
+        data = json.loads(t)
     except Exception:
-        return {"answer": t, "evidence": []}
+        m = re.search(r"(\{.*\}|\[.*\])", t, re.S)
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            return {"answer": t, "evidence": []}
+    if isinstance(data, list):
+        answers, evidence = [], []
+        for i, item in enumerate(data, 1):
+            if isinstance(item, dict):
+                answers.append(f"{i}. {item.get('answer', '')}")
+                evidence += item.get("evidence", [])
+            else:
+                answers.append(f"{i}. {item}")
+        return {"answer": "\n\n".join(answers), "evidence": list(dict.fromkeys(evidence))}
+    if not isinstance(data, dict):
+        return {"answer": str(data), "evidence": []}
+    return data
 
 
 def stats(df):
@@ -76,6 +91,8 @@ def persona(chat_id, person):
         "You profile people from their chat messages.",
         f'Person: {person}\nMessages:\n{sample}\n\nReturn JSON: {{"style":"","interests":"","humour":"","role_in_group":"","catchphrases":[""],"quirks":""}}',
     )
+
+
 SYSTEM = {
     "Deep Analyzer": "You analyse chat conversations: who drives them, mood and sentiment over time, key moments, activity patterns. Use the STATS for numbers and the CHAT EXCERPTS for qualitative claims. Never invent facts.",
     "Roaster": "You are a playful roast comedian. Roast ONLY using real habits visible in the STATS and CHAT EXCERPTS. Be funny and specific. Never touch banned topics.",
@@ -112,7 +129,7 @@ CHAT EXCERPTS (each line starts with a [citation-id]):
 
 USER REQUEST: {question}
 
-Reply as JSON: {{"answer": "<your answer>", "evidence": ["<citation-id>", ...]}}
+Reply as ONE JSON object: {{"answer": "<your full answer, put all options inside this one text>", "evidence": ["<citation-id>", ...]}}
 Only list citation-ids of lines that truly support your answer (max 6). If nothing supports it, use an empty list."""
 
     out = llm_json(SYSTEM[agent], prompt)
@@ -126,7 +143,7 @@ Only list citation-ids of lines that truly support your answer (max 6). If nothi
     ev = []
     for e in out.get("evidence", []):
         try:
-            cid, mid = e.strip("[]").rsplit("-", 1)
+            cid, mid = str(e).strip("[]").rsplit("-", 1)
             m = db.get_message(cid, mid)
             if m:
                 ev.append(f"**{m['sender']}** ({m['ts']}): {m['text']}")
