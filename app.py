@@ -13,15 +13,23 @@ with st.sidebar:
     proj_in = st.text_input("Project name", "Suman")
     files = st.file_uploader("WhatsApp .txt exports", type="txt", accept_multiple_files=True)
     if st.button("Process") and files:
+        existing = {(c["project"], c["name"]) for c in db.list_chats()}
+        added = 0
         for f in files:
+            name = f.name.replace(".txt", "")
+            if (proj_in, name) in existing:
+                st.warning(f"'{f.name}' is already in project '{proj_in}', skipped")
+                continue
             df = parse(f.read().decode("utf-8", errors="ignore"))
             if df.empty:
                 st.error(f"{f.name}: couldn't parse")
                 continue
-            cid = db.save_chat(proj_in, f.name.replace(".txt", ""), df)
+            cid = db.save_chat(proj_in, name, df)
             rag.index_chat(cid, df)
-        st.success("Done")
-        st.rerun()
+            added += 1
+        if added:
+            st.success(f"Added {added} chat(s)")
+            st.rerun()
 
     chats = db.list_chats()
     if not chats:
